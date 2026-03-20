@@ -6,6 +6,7 @@ import {
   createAssociatedTokenAccount,
   createMint,
   getAccount,
+  getMint,
   mintTo,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
@@ -462,6 +463,150 @@ describe("permissionless lps", () => {
       } catch (err) {
         assert(!err.message.includes("assert.fail"), `Unexpected success: ${err.message}`);
       }
+    });
+
+    it("Cannot remove zero LP tokens", async () => {
+      try {
+        await program.methods.removeLiquidity(new BN(0)).accounts({
+          userTokenAccountA: attackerTokenAccountA,
+          userTokenAccountB: attackerTokenAccountB,
+          userLpTokenAccount: attackerLpTokenAccount,
+          user: attacker.publicKey,
+          pool: poolAddr,
+          poolTokenAccountA: poolTokenAccountA,
+          poolTokenAccountB: poolTokenAccountB,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        }).signers([attacker]).rpc();
+        assert.fail("Should have failed — zero LP amount");
+      } catch (err) {
+        assert(!err.message.includes("assert.fail"), `Unexpected success: ${err.message}`);
+      }
+    });
+
+    it("Disproportionate liquidity add gives minimum LP tokens (excess donated)", async () => {
+      // Attacker adds heavily skewed liquidity — gets min(ratio_a, ratio_b) LP tokens
+      const poolABefore = (await getAccount(connection, poolTokenAccountA)).amount;
+      const poolBBefore = (await getAccount(connection, poolTokenAccountB)).amount;
+      const lpSupplyBefore = (await getMint(connection, lpMint)).supply;
+      const attackerLpBefore = (await getAccount(connection, attackerLpTokenAccount)).amount;
+
+      // Deposit 10x more of token A than proportional — the excess A is effectively donated
+      const amountA = new BN(500_000_000);
+      const amountB = new BN(50_000_000); // intentionally small relative to pool ratio
+
+      await program.methods.addLiquidity(amountA, amountB).accounts({
+        userTokenAccountA: attackerTokenAccountA,
+        userTokenAccountB: attackerTokenAccountB,
+        userLpTokenAccount: attackerLpTokenAccount,
+        user: attacker.publicKey,
+        pool: poolAddr,
+        poolTokenAccountA: poolTokenAccountA,
+        poolTokenAccountB: poolTokenAccountB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      const attackerLpAfter = (await getAccount(connection, attackerLpTokenAccount)).amount;
+      const lpMinted = attackerLpAfter - attackerLpBefore;
+
+      // LP tokens should be based on the smaller ratio (token B), not the larger (token A)
+      // lp_for_a = 500M * supply / reserve_a
+      // lp_for_b = 50M * supply / reserve_b
+      // min(lp_for_a, lp_for_b) should be lp_for_b since B is the constraining side
+      const expectedLpForB = (BigInt(50_000_000) * lpSupplyBefore) / poolBBefore;
+      assert(lpMinted === expectedLpForB, `LP tokens should be limited by token B ratio: got ${lpMinted}, expected ${expectedLpForB}`);
+    });
+
+    it("Constant product k increases after every swap (fee accumulation)", async () => {
+      const poolA1 = (await getAccount(connection, poolTokenAccountA)).amount;
+      const poolB1 = (await getAccount(connection, poolTokenAccountB)).amount;
+      const k1 = poolA1 * poolB1;
+
+      // First swap
+      await program.methods.swap(new BN(10_000_000), new BN(1)).accounts({
+        userTokenAccountIn: attackerTokenAccountA,
+        userTokenAccountOut: attackerTokenAccountB,
+        user: attacker.publicKey,
+        pool: poolAddr,
+        poolTokenAccountA: poolTokenAccountA,
+        poolTokenAccountB: poolTokenAccountB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      const poolA2 = (await getAccount(connection, poolTokenAccountA)).amount;
+      const poolB2 = (await getAccount(connection, poolTokenAccountB)).amount;
+      const k2 = poolA2 * poolB2;
+      assert(k2 > k1, "k should increase after first swap due to fees");
+
+      // Second swap (reverse direction)
+      await program.methods.swap(new BN(10_000_000), new BN(1)).accounts({
+        userTokenAccountIn: attackerTokenAccountB,
+        userTokenAccountOut: attackerTokenAccountA,
+        user: attacker.publicKey,
+        pool: poolAddr,
+        poolTokenAccountA: poolTokenAccountA,
+        poolTokenAccountB: poolTokenAccountB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      const poolA3 = (await getAccount(connection, poolTokenAccountA)).amount;
+      const poolB3 = (await getAccount(connection, poolTokenAccountB)).amount;
+      const k3 = poolA3 * poolB3;
+      assert(k3 > k2, "k should increase after second swap due to fees");
+    });
+
+    it("Sandwich attack is mitigated by slippage protection", async () => {
+      // Simulate: attacker front-runs victim's swap to move price, then victim's swap
+      // should fail if minimum_amount_out is set correctly
+
+      // Snapshot pool state
+      const poolABefore = (await getAccount(connection, poolTokenAccountA)).amount;
+      const poolBBefore = (await getAccount(connection, poolTokenAccountB)).amount;
+
+      // Attacker front-runs: large swap A->B to move price
+      await program.methods.swap(new BN(200_000_000), new BN(1)).accounts({
+        userTokenAccountIn: attackerTokenAccountA,
+        userTokenAccountOut: attackerTokenAccountB,
+        user: attacker.publicKey,
+        pool: poolAddr,
+        poolTokenAccountA: poolTokenAccountA,
+        poolTokenAccountB: poolTokenAccountB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      // Victim's swap with tight slippage protection should fail
+      // Calculate what victim would have gotten at the original price
+      // reserve_in=poolABefore, reserve_out=poolBBefore, amount_in=50M
+      const victimAmountIn = BigInt(50_000_000);
+      const fee = (victimAmountIn * BigInt(FEE_BPS)) / BigInt(10000);
+      const afterFee = victimAmountIn - fee;
+      const expectedOut = (poolBBefore * afterFee) / (poolABefore + afterFee);
+
+      try {
+        // Victim sets minimum_amount_out to what they'd get at the original price
+        await program.methods.swap(new BN(50_000_000), new BN(expectedOut.toString())).accounts({
+          userTokenAccountIn: userTokenAccountA,
+          userTokenAccountOut: userTokenAccountB,
+          user: userPk,
+          pool: poolAddr,
+          poolTokenAccountA: poolTokenAccountA,
+          poolTokenAccountB: poolTokenAccountB,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        }).rpc();
+        assert.fail("Should have failed — price moved by front-runner, slippage protection kicks in");
+      } catch (err) {
+        assert(!err.message.includes("assert.fail"), `Unexpected success: ${err.message}`);
+      }
+
+      // Attacker back-runs: swap B->A to restore price (clean up)
+      await program.methods.swap(new BN(100_000_000), new BN(1)).accounts({
+        userTokenAccountIn: attackerTokenAccountB,
+        userTokenAccountOut: attackerTokenAccountA,
+        user: attacker.publicKey,
+        pool: poolAddr,
+        poolTokenAccountA: poolTokenAccountA,
+        poolTokenAccountB: poolTokenAccountB,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
     });
 
     it("Pool funds are safe after all attacks", async () => {

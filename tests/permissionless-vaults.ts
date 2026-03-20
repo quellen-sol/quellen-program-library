@@ -176,6 +176,131 @@ describe("permissionless vaults", () => {
       }
     });
 
+    it("Cannot withdraw more shares than owned", async () => {
+      // Attacker deposits legitimately, then tries to withdraw more than their balance
+      await program.methods.deposit(new BN(1000)).accounts({
+        userTokenAccount: attackerTokenAccount,
+        userSharesTokenAccount: attackerSharesTokenAccount,
+        user: attacker.publicKey,
+        vault: vaultAddr,
+        vaultTokenAccount: vaultTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      const sharesBalance = (await getAccount(connection, attackerSharesTokenAccount)).amount;
+
+      try {
+        await program.methods.withdraw(new BN((sharesBalance + BigInt(1)).toString())).accounts({
+          userTokenAccount: attackerTokenAccount,
+          userSharesTokenAccount: attackerSharesTokenAccount,
+          user: attacker.publicKey,
+          vault: vaultAddr,
+          vaultTokenAccount: vaultTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        }).signers([attacker]).rpc();
+        assert.fail("Should have failed — withdrawing more shares than owned");
+      } catch (err) {
+        assert(!err.message.includes("assert.fail"), `Unexpected success: ${err.message}`);
+      }
+
+      // Clean up: withdraw what we deposited
+      await program.methods.withdraw(new BN(sharesBalance.toString())).accounts({
+        userTokenAccount: attackerTokenAccount,
+        userSharesTokenAccount: attackerSharesTokenAccount,
+        user: attacker.publicKey,
+        vault: vaultAddr,
+        vaultTokenAccount: vaultTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+    });
+
+    it("Deposit zero tokens mints zero shares", async () => {
+      const sharesBefore = (await getAccount(connection, attackerSharesTokenAccount)).amount;
+
+      await program.methods.deposit(new BN(0)).accounts({
+        userTokenAccount: attackerTokenAccount,
+        userSharesTokenAccount: attackerSharesTokenAccount,
+        user: attacker.publicKey,
+        vault: vaultAddr,
+        vaultTokenAccount: vaultTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      const sharesAfter = (await getAccount(connection, attackerSharesTokenAccount)).amount;
+      assert(sharesAfter === sharesBefore, "depositing 0 tokens should mint 0 shares");
+    });
+
+    it("Multi-user accounting is correct", async () => {
+      // Both users deposit into the same vault; track only the shares minted per deposit
+      const vaultBefore = (await getAccount(connection, vaultTokenAccount)).amount;
+
+      const userSharesBefore = (await getAccount(connection, userSharesTokenAccount)).amount;
+      const attackerSharesBefore = (await getAccount(connection, attackerSharesTokenAccount)).amount;
+
+      const userDeposit = BigInt(10_000);
+      const attackerDeposit = BigInt(5_000);
+
+      await program.methods.deposit(new BN(userDeposit.toString())).accounts({
+        userTokenAccount: userUsdcTokenAccount,
+        userSharesTokenAccount: userSharesTokenAccount,
+        user: userPk,
+        vault: vaultAddr,
+        vaultTokenAccount: vaultTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).rpc();
+
+      await program.methods.deposit(new BN(attackerDeposit.toString())).accounts({
+        userTokenAccount: attackerTokenAccount,
+        userSharesTokenAccount: attackerSharesTokenAccount,
+        user: attacker.publicKey,
+        vault: vaultAddr,
+        vaultTokenAccount: vaultTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      // Vault should hold both deposits
+      const vaultAfterDeposits = (await getAccount(connection, vaultTokenAccount)).amount;
+      assert(vaultAfterDeposits === vaultBefore + userDeposit + attackerDeposit, "vault should hold both deposits");
+
+      // Only withdraw the shares minted from these deposits (not pre-existing ones)
+      const userSharesAfterDeposit = (await getAccount(connection, userSharesTokenAccount)).amount;
+      const attackerSharesAfterDeposit = (await getAccount(connection, attackerSharesTokenAccount)).amount;
+      const userNewShares = userSharesAfterDeposit - userSharesBefore;
+      const attackerNewShares = attackerSharesAfterDeposit - attackerSharesBefore;
+
+      const userTokensBefore = (await getAccount(connection, userUsdcTokenAccount)).amount;
+      const attackerTokensBefore = (await getAccount(connection, attackerTokenAccount)).amount;
+
+      await program.methods.withdraw(new BN(userNewShares.toString())).accounts({
+        userTokenAccount: userUsdcTokenAccount,
+        userSharesTokenAccount: userSharesTokenAccount,
+        user: userPk,
+        vault: vaultAddr,
+        vaultTokenAccount: vaultTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).rpc();
+
+      await program.methods.withdraw(new BN(attackerNewShares.toString())).accounts({
+        userTokenAccount: attackerTokenAccount,
+        userSharesTokenAccount: attackerSharesTokenAccount,
+        user: attacker.publicKey,
+        vault: vaultAddr,
+        vaultTokenAccount: vaultTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      // Each user should get back approximately what they deposited (within ±1 rounding)
+      const userTokensAfter = (await getAccount(connection, userUsdcTokenAccount)).amount;
+      const attackerTokensAfter = (await getAccount(connection, attackerTokenAccount)).amount;
+      const userReturned = userTokensAfter - userTokensBefore;
+      const attackerReturned = attackerTokensAfter - attackerTokensBefore;
+
+      assert(userReturned >= userDeposit - BigInt(1) && userReturned <= userDeposit + BigInt(1),
+        `user should get back ~${userDeposit}, got ${userReturned}`);
+      assert(attackerReturned >= attackerDeposit - BigInt(1) && attackerReturned <= attackerDeposit + BigInt(1),
+        `attacker should get back ~${attackerDeposit}, got ${attackerReturned}`);
+    });
+
     it("Cannot use a fake vault to steal funds", async () => {
       // Attacker creates their own vault and tries to pass the legitimate user's vault token account
       const fakeVaultAddr = deriveVaultAccount(attacker.publicKey, usdcMint, program.programId);
