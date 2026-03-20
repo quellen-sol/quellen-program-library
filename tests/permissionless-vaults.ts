@@ -1,10 +1,9 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { PermissionlessVaults } from "../target/types/permissionless_vaults";
-import { ASSOCIATED_TOKEN_PROGRAM_ID, createAssociatedTokenAccount, createMint, mintTo, TOKEN_PROGRAM_ID, transfer } from "@solana/spl-token";
+import { createAssociatedTokenAccount, createMint, getAccount, mintTo, TOKEN_PROGRAM_ID, transfer } from "@solana/spl-token";
 import { BN } from "bn.js";
 import { assert } from "chai";
-import { SYSTEM_PROGRAM_ID } from "@coral-xyz/anchor/dist/cjs/native/system";
 
 function deriveVaultAccount(user: anchor.web3.PublicKey, mint: anchor.web3.PublicKey, pid: anchor.web3.PublicKey) {
   return anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("vault"), user.toBuffer(), mint.toBuffer()], pid)[0]
@@ -69,11 +68,8 @@ describe("permissionless vaults", () => {
       tokenProgram: TOKEN_PROGRAM_ID,
     }).rpc();
 
-    const sharesATA = await connection.getParsedTokenAccountsByOwner(userPk, {
-      mint: vUsdcMint,
-      programId: TOKEN_PROGRAM_ID,
-    });
-    assert(sharesATA.value[0]?.account.data.parsed.info.tokenAmount.amount === "10");
+    const sharesAccount = await getAccount(connection, userSharesTokenAccount);
+    assert(sharesAccount.amount === BigInt(10));
   });
 
   it("User emits 5 tokens into vault", async () => {
@@ -90,14 +86,137 @@ describe("permissionless vaults", () => {
       tokenProgram: TOKEN_PROGRAM_ID,
     }).rpc();
 
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(userPk, {
-      programId: TOKEN_PROGRAM_ID,
+    const sharesAccount = await getAccount(connection, userSharesTokenAccount);
+    const underlyingAccount = await getAccount(connection, userUsdcTokenAccount);
+    assert(sharesAccount.amount === BigInt(0));
+    assert(underlyingAccount.amount === BigInt(1_000_000));
+  });
+
+  // ── Adversarial tests ──
+
+  describe("malicious actor", () => {
+    let attacker: anchor.web3.Keypair;
+    let attackerTokenAccount: anchor.web3.PublicKey;
+    let attackerSharesTokenAccount: anchor.web3.PublicKey;
+
+    before(async () => {
+      const payer = program.provider.wallet.payer;
+      attacker = anchor.web3.Keypair.generate();
+
+      // Fund the attacker with SOL
+      const sig = await connection.requestAirdrop(attacker.publicKey, 10 * anchor.web3.LAMPORTS_PER_SOL);
+      await connection.confirmTransaction(sig);
+
+      // Create attacker's token accounts
+      attackerTokenAccount = await createAssociatedTokenAccount(connection, payer, usdcMint, attacker.publicKey);
+      attackerSharesTokenAccount = await createAssociatedTokenAccount(connection, payer, vUsdcMint, attacker.publicKey);
+
+      // Give attacker some tokens to attempt attacks with
+      await mintTo(connection, payer, usdcMint, attackerTokenAccount, payer, 500_000);
+
+      // Legitimate user re-deposits so the vault has funds to steal
+      await program.methods.deposit(new BN(500_000)).accounts({
+        userTokenAccount: userUsdcTokenAccount,
+        userSharesTokenAccount: userSharesTokenAccount,
+        user: userPk,
+        vault: vaultAddr,
+        vaultTokenAccount: vaultTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).rpc();
     });
-    const sharesATA = tokenAccounts.value.find((a) => a.account.data.parsed.info.mint === vUsdcMint.toString());
-    const underlyingATA = tokenAccounts.value.find((a) => a.account.data.parsed.info.mint === usdcMint.toString());
-    const sharesBalance = Number(sharesATA.account.data.parsed.info.tokenAmount.amount);
-    const underlyingBalance = Number(underlyingATA.account.data.parsed.info.tokenAmount.amount);
-    assert(sharesBalance === 0);
-    assert(underlyingBalance === 1_000_000);
+
+    it("Cannot withdraw shares they don't have", async () => {
+      try {
+        await program.methods.withdraw(new BN(100)).accounts({
+          userTokenAccount: attackerTokenAccount,
+          userSharesTokenAccount: attackerSharesTokenAccount,
+          user: attacker.publicKey,
+          vault: vaultAddr,
+          vaultTokenAccount: vaultTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        }).signers([attacker]).rpc();
+        assert.fail("Should have failed — attacker has no shares to burn");
+      } catch (err) {
+        assert(err.message.includes("insufficient"), `Unexpected error: ${err.message}`);
+      }
+    });
+
+    it("Cannot withdraw using someone else's shares token account", async () => {
+      // Attacker tries to pass the legitimate user's shares account to steal funds
+      try {
+        await program.methods.withdraw(new BN(100)).accounts({
+          userTokenAccount: attackerTokenAccount,
+          userSharesTokenAccount: userSharesTokenAccount,
+          user: attacker.publicKey,
+          vault: vaultAddr,
+          vaultTokenAccount: vaultTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        }).signers([attacker]).rpc();
+        assert.fail("Should have failed — shares account authority doesn't match signer");
+      } catch (err) {
+        assert(!err.message.includes("assert.fail"), `Unexpected success: ${err.message}`);
+      }
+    });
+
+    it("Cannot deposit and redirect shares to someone else's account", async () => {
+      // Attacker deposits but tries to get shares minted to the legitimate user's shares account
+      // (trying to manipulate share pricing). The constraint `token::authority = user` blocks this.
+      try {
+        await program.methods.deposit(new BN(100)).accounts({
+          userTokenAccount: attackerTokenAccount,
+          userSharesTokenAccount: userSharesTokenAccount,
+          user: attacker.publicKey,
+          vault: vaultAddr,
+          vaultTokenAccount: vaultTokenAccount,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        }).signers([attacker]).rpc();
+        assert.fail("Should have failed — shares account authority doesn't match signer");
+      } catch (err) {
+        assert(!err.message.includes("assert.fail"), `Unexpected success: ${err.message}`);
+      }
+    });
+
+    it("Cannot use a fake vault to steal funds", async () => {
+      // Attacker creates their own vault and tries to pass the legitimate user's vault token account
+      const fakeVaultAddr = deriveVaultAccount(attacker.publicKey, usdcMint, program.programId);
+      const fakeVUsdcMint = deriveSharesMint(fakeVaultAddr, program.programId);
+      const fakeVaultTokenAccount = deriveVaultTokenAccount(fakeVaultAddr, program.programId);
+
+      // Initialize attacker's own vault
+      await program.methods.initializeVault().accounts({
+        authority: attacker.publicKey,
+        underlyingMint: usdcMint,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      const fakeSharesAccount = await createAssociatedTokenAccount(
+        connection, program.provider.wallet.payer, fakeVUsdcMint, attacker.publicKey
+      );
+
+      // Deposit into attacker's vault
+      await program.methods.deposit(new BN(100)).accounts({
+        userTokenAccount: attackerTokenAccount,
+        userSharesTokenAccount: fakeSharesAccount,
+        user: attacker.publicKey,
+        vault: fakeVaultAddr,
+        vaultTokenAccount: fakeVaultTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      }).signers([attacker]).rpc();
+
+      // Try to withdraw from attacker's vault but pointing to the legitimate user's vault token account
+      try {
+        await program.methods.withdraw(new BN(100)).accounts({
+          userTokenAccount: attackerTokenAccount,
+          userSharesTokenAccount: fakeSharesAccount,
+          user: attacker.publicKey,
+          vault: fakeVaultAddr,
+          vaultTokenAccount: vaultTokenAccount, // legitimate user's vault token account
+          tokenProgram: TOKEN_PROGRAM_ID,
+        }).signers([attacker]).rpc();
+        assert.fail("Should have failed — vault token account doesn't belong to attacker's vault");
+      } catch (err) {
+        assert(!err.message.includes("assert.fail"), `Unexpected success: ${err.message}`);
+      }
+    });
   });
 });

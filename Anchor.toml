@@ -1,18 +1,19 @@
 [toolchain]
 
 [features]
-seeds = false
+resolution = true
 skip-lint = false
 
 [programs.localnet]
+permissionless-lps = "31fPCYPHVvggaGvfyWhiUASY4LDwefT5ZEhUtCHN4nC8"
 permissionless-vaults = "AYd3r7b9JYXmWdC8MqG6nCiaAgs3LqKA2xXEZ1gHNocK"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
-wallet = "/home/quellen/.config/solana/id.json"
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
 
 [scripts]
 test = "pnpm ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
