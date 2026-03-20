@@ -1,11 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface};
 
-use crate::{
-    error::VaultsError,
-    seeds::{SHARES_SEED, VAULT_SEED},
-    state::vault::Vault,
-};
+use crate::{error::VaultsError, events::WithdrawEvent, seeds::VAULT_SEED, state::vault::Vault};
 
 #[derive(Accounts)]
 #[instruction(amount: u64)]
@@ -82,12 +78,18 @@ pub fn handle_withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
         },
         vault_signer,
     );
-
     token_interface::transfer_checked(
         txfer_to_user_cpi_ctx,
         amount_to_return,
         ctx.accounts.underlying_mint.decimals,
     )?;
+
+    emit!(WithdrawEvent {
+        vault: ctx.accounts.vault.key(),
+        user: ctx.accounts.user.key(),
+        shares_in: amount,
+        tokens_out: amount_to_return,
+    });
 
     Ok(())
 }

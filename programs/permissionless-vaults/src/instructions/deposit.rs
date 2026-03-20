@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface};
 
-use crate::{error::VaultsError, seeds::{SHARES_SEED, VAULT_SEED}, state::vault::Vault};
+use crate::{error::VaultsError, events::DepositEvent, seeds::VAULT_SEED, state::vault::Vault};
 
 #[derive(Accounts)]
 #[instruction(amount: u64)]
@@ -12,7 +12,7 @@ pub struct Deposit<'info> {
     #[account(mut, token::authority = user)]
     pub user_shares_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account()]
     pub user: Signer<'info>,
 
     #[account(
@@ -87,6 +87,13 @@ pub fn handle_deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
             .unwrap()
     };
     token_interface::mint_to(mint_cpi_ctx, amount_to_mint)?;
+
+    emit!(DepositEvent {
+        vault: ctx.accounts.vault.key(),
+        user: ctx.accounts.user.key(),
+        tokens_in: amount,
+        shares_out: amount_to_mint,
+    });
 
     Ok(())
 }

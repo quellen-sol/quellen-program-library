@@ -2,6 +2,7 @@ use crate::instructions::*;
 use anchor_lang::prelude::*;
 
 pub mod error;
+pub mod events;
 pub mod instructions;
 pub mod seeds;
 pub mod state;
